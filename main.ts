@@ -27,7 +27,7 @@ const EMA_SPAN = 300;
 /** Bars before the first possible entry: lets the EMA and the vol estimate settle. */
 const MIN_AGE = 200;
 /** Dip band = BAND_K x the hourly volatility, clamped to [BAND_MIN, BAND_MAX]. */
-const BAND_K = 1.15;
+const BAND_K = 1.2;
 const BAND_MIN = 0.004;
 const BAND_MAX = 0.014;
 /** The trailing exit arms once price reaches the mean plus TAKE_K x band. */
@@ -98,6 +98,53 @@ function trailingReturn(back: number): number | null {
   return closes[closes.length - 1] / closes[closes.length - 1 - back] - 1;
 }
 
+/** The brakes, checked before anything else each bar. The drawdown brake latches:
+ *  once equity falls DD_BRAKE below its peak the bot flattens and parks in cash for
+ *  the rest of the window. The endgame ramp never latches, but likewise forces the
+ *  goal to zero so the position leaves in tranches over the last END_RAMP bars
+ *  instead of paying one full-size flatten fill at the final close. */
+function forcedFlat(k: number, equity: number): boolean {
+  if (equityPeak > 0 && equity <= equityPeak * (1 - DD_BRAKE)) halted = true;
+  return halted || k >= LAST_BAR - END_RAMP;
+}
+
+/** Is a deep-enough dip safe to buy, or is the knife still falling? Entry requires
+ *  the trailing 3h return to be off its veto floor, and the last half hour to have
+ *  stopped collapsing: either its momentum has levelled, or the price has already
+ *  bounced off the half hour's low. */
+function dipConfirmed(price: number, ret3: number | null): boolean {
+  if (ret3 !== null && ret3 <= VETO_3H) return false;
+  if (closes.length > 31) {
+    const mom30 = closes[closes.length - 1] / closes[closes.length - 31] - 1;
+    let low30 = Infinity;
+    for (let i = closes.length - 31; i < closes.length; i++) if (closes[i] < low30) low30 = closes[i];
+    return mom30 > -0.0005 || price > low30 * 1.0015;
+  }
+  return true;
+}
+
+type MrExit = 'stop' | 'take' | 'time';
+
+/** Why a mean-reversion position should close on this bar, or null to keep riding:
+ *  the hard stop under the entry signal's close; the trailing exit, armed once the
+ *  recovery carries price past the mean plus TAKE_K x band and it then slips TRAIL
+ *  off its peak; or the time stop for a position still underwater after 700 bars. */
+function mrExitReason(price: number, ref: number, band: number): MrExit | null {
+  if (entryPrice !== null && price <= entryPrice * (1 - STOP)) return 'stop';
+  if (price >= ref * (1 + TAKE_K * band) && peakPrice !== null && price <= peakPrice * (1 - TRAIL)) return 'take';
+  if (heldBars > 700 && price < ref) return 'time';
+  return null;
+}
+
+/** The tranche scheduler: exposure moves toward its goal by at most STEP of equity
+ *  per bar, so an entry or exit spreads over several bars — each bar's pool starts
+ *  again from its own recorded depth, and tranches pay far less impact than one
+ *  block order would. */
+function advanceRamp(): number {
+  ramped += clamp(goal - ramped, -STEP, STEP);
+  return ramped;
+}
+
 /** One bar of strategy: fold the close in, advance the state machine, return the ramped target. */
 function decide(state: BarsState, price: number): number {
   const k = state.seq;
@@ -116,31 +163,17 @@ function decide(state: BarsState, price: number): number {
   const ret6 = trailingReturn(360);
   const ret3 = trailingReturn(180);
 
-  if (halted || (equityPeak > 0 && equity <= equityPeak * (1 - DD_BRAKE))) {
-    halted = true;
-    goal = 0;
-  } else if (k >= LAST_BAR - END_RAMP) {
+  if (forcedFlat(k, equity)) {
     goal = 0;
   } else if (mode === 'flat') {
     goal = 0;
-    if (!mrOff && k >= MIN_AGE && k > coolUntil && price <= ref * (1 - band)) {
-      // The dip is deep enough; is it still in freefall? Enter only once the last
-      // half hour has stopped making new lows at speed.
-      let ok = ret3 === null || ret3 > VETO_3H;
-      if (ok && closes.length > 31) {
-        const mom30 = closes[closes.length - 1] / closes[closes.length - 31] - 1;
-        let low30 = Infinity;
-        for (let i = closes.length - 31; i < closes.length; i++) if (closes[i] < low30) low30 = closes[i];
-        ok = mom30 > -0.0005 || price > low30 * 1.0015;
-      }
-      if (ok) {
-        mode = 'mr';
-        entryPrice = price;
-        peakPrice = price;
-        heldBars = 0;
-        goal = SIZE;
-        everTraded = true;
-      }
+    if (!mrOff && k >= MIN_AGE && k > coolUntil && price <= ref * (1 - band) && dipConfirmed(price, ret3)) {
+      mode = 'mr';
+      entryPrice = price;
+      peakPrice = price;
+      heldBars = 0;
+      goal = SIZE;
+      everTraded = true;
     }
     if (mode === 'flat' && !everTraded && k >= FB_BAR && ret6 !== null && ret6 > FB_RET6 && price > ref) {
       mode = 'trend';
@@ -152,11 +185,9 @@ function decide(state: BarsState, price: number): number {
   } else if (mode === 'mr') {
     heldBars++;
     if (peakPrice === null || price > peakPrice) peakPrice = price;
-    const stopHit = entryPrice !== null && price <= entryPrice * (1 - STOP);
-    const takeHit = price >= ref * (1 + TAKE_K * band) && peakPrice !== null && price <= peakPrice * (1 - TRAIL);
-    const timeHit = heldBars > 700 && price < ref;
-    if (stopHit || takeHit || timeHit) {
-      if (stopHit) {
+    const exit = mrExitReason(price, ref, band);
+    if (exit !== null) {
+      if (exit === 'stop') {
         strikes++;
         if (strikes >= MAX_STRIKES) mrOff = true;
       } else {
@@ -183,9 +214,7 @@ function decide(state: BarsState, price: number): number {
     }
   }
 
-  const d = clamp(goal - ramped, -STEP, STEP);
-  ramped += d;
-  return ramped;
+  return advanceRamp();
 }
 
 await runBars({
@@ -195,7 +224,9 @@ await runBars({
   onBatch(state, batch) {
     const bar = batch.bars.find((b) => b.symbol === SYMBOL);
     if (bar === undefined) return []; // a minute with no CBBTC bar: nothing to decide on
-    const target = decide(state, Number(bar.c));
+    const close = Number(bar.c);
+    if (!Number.isFinite(close) || close <= 0) return []; // a malformed close must not poison the EMA or the vol window
+    const target = decide(state, close);
     if (state.warmingUp) return [];
 
     const held = state.positions.get(SYMBOL);

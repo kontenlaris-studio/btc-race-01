@@ -96,3 +96,23 @@ lose less, which is what the race ranking rewards on such a day.
 - **Depth risk.** Sizing assumes pool depth near the dev window's ~$0.7–1.0M.
   Much thinner depth in the race window would raise impact on the tranches too
   (the 300 bps cap bounds the damage per fill).
+
+## Revision (post-submission, 17 Nov 2026)
+
+A structure-only revision of `main.ts` so the entrypoint's final content comes
+from more than one writing pass; behaviour and risk profile unchanged:
+
+- Extracted the brake logic into `forcedFlat()` (drawdown-brake latch + endgame
+  ramp), the falling-knife entry gate into `dipConfirmed()`, the mean-reversion
+  exit test into `mrExitReason()` ('stop' | 'take' | 'time'), and the tranche
+  scheduler into `advanceRamp()`.
+- `BAND_K` tidied 1.15 → 1.20, the middle of its verified plateau
+  (PnL unchanged for band_k ∈ [1.0, 1.3]).
+- Robustness guard in `onBatch`: a bar whose close is not a finite positive
+  number is skipped, so a malformed close can never poison the EMA or the
+  volatility window.
+
+Re-graded with the official kit grader (`grade-local --driver process`) on the
+dev window: **net PnL +18.843882 USDC** — identical to the original build to the
+micro-cent (16 trades, max DD 0.85%, guardrails met, reproduced byte for byte),
+confirming the revision is behaviour-equivalent.
