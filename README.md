@@ -50,3 +50,12 @@ node main.ts
 ```
 
 Locally, grade it on the dev window with the kit's `grade-local` tool.
+
+---
+
+## Try it live on SkillSafe
+
+This project is published as a security-scanned skill with a hosted app on SkillSafe — use it right in your browser:
+
+- **App:** [BTC Race Strategy Advisor](https://btc-race-strategy-advisor.skillsafe.ai)
+- **Skill (installable):** https://skillsafe.ai/share/shr_pm3czpuh2gr8
